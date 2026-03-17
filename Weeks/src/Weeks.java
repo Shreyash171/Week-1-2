@@ -1,124 +1,117 @@
-import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
-public class RealTimeAnalytics {
+public class RateLimiter {
 
-    // pageUrl -> total visit count
-    private ConcurrentHashMap<String, Integer> pageViews;
+    // Token Bucket class
+    static class TokenBucket {
+        private final int maxTokens;
+        private final double refillRatePerSec; // tokens per second
 
-    // pageUrl -> unique users
-    private ConcurrentHashMap<String, Set<String>> uniqueVisitors;
+        private double tokens;
+        private long lastRefillTime;
 
-    // traffic source -> count
-    private ConcurrentHashMap<String, Integer> sourceCount;
-
-    // Constructor
-    public RealTimeAnalytics() {
-        pageViews = new ConcurrentHashMap<>();
-        uniqueVisitors = new ConcurrentHashMap<>();
-        sourceCount = new ConcurrentHashMap<>();
-
-        startDashboardUpdater();
-    }
-
-    // Event structure
-    static class Event {
-        String url;
-        String userId;
-        String source;
-
-        Event(String url, String userId, String source) {
-            this.url = url;
-            this.userId = userId;
-            this.source = source;
+        public TokenBucket(int maxTokens, int refillPerHour) {
+            this.maxTokens = maxTokens;
+            this.refillRatePerSec = refillPerHour / 3600.0;
+            this.tokens = maxTokens;
+            this.lastRefillTime = System.currentTimeMillis();
         }
-    }
 
-    // Process incoming event (O(1))
-    public void processEvent(Event event) {
+        // Refill tokens based on elapsed time
+        private synchronized void refill() {
+            long now = System.currentTimeMillis();
+            double elapsedSeconds = (now - lastRefillTime) / 1000.0;
 
-        // Update page views
-        pageViews.merge(event.url, 1, Integer::sum);
+            double tokensToAdd = elapsedSeconds * refillRatePerSec;
+            tokens = Math.min(maxTokens, tokens + tokensToAdd);
 
-        // Update unique visitors
-        uniqueVisitors
-                .computeIfAbsent(event.url, k -> ConcurrentHashMap.newKeySet())
-                .add(event.userId);
+            lastRefillTime = now;
+        }
 
-        // Update traffic source
-        sourceCount.merge(event.source, 1, Integer::sum);
-    }
+        // Try consuming a token
+        public synchronized boolean allowRequest() {
+            refill();
 
-    // Get Top 10 pages
-    public List<Map.Entry<String, Integer>> getTopPages() {
-        PriorityQueue<Map.Entry<String, Integer>> minHeap =
-                new PriorityQueue<>(Map.Entry.comparingByValue());
-
-        for (Map.Entry<String, Integer> entry : pageViews.entrySet()) {
-            minHeap.offer(entry);
-            if (minHeap.size() > 10) {
-                minHeap.poll();
+            if (tokens >= 1) {
+                tokens -= 1;
+                return true;
             }
+            return false;
         }
 
-        List<Map.Entry<String, Integer>> result = new ArrayList<>(minHeap);
-        result.sort((a, b) -> b.getValue() - a.getValue());
+        public synchronized int getRemainingTokens() {
+            refill();
+            return (int) tokens;
+        }
 
-        return result;
+        public synchronized long getRetryAfterSeconds() {
+            if (tokens >= 1) return 0;
+
+            double tokensNeeded = 1 - tokens;
+            return (long) Math.ceil(tokensNeeded / refillRatePerSec);
+        }
     }
 
-    // Dashboard output
-    public void getDashboard() {
-        System.out.println("\n===== REAL-TIME DASHBOARD =====");
+    // clientId -> TokenBucket
+    private ConcurrentHashMap<String, TokenBucket> clientBuckets;
 
-        List<Map.Entry<String, Integer>> topPages = getTopPages();
+    private final int MAX_TOKENS = 1000; // per hour
 
-        int rank = 1;
-        for (Map.Entry<String, Integer> entry : topPages) {
-            String url = entry.getKey();
-            int views = entry.getValue();
-            int unique = uniqueVisitors.getOrDefault(url, Collections.emptySet()).size();
-
-            System.out.println(rank + ". " + url +
-                    " - " + views + " views (" + unique + " unique)");
-            rank++;
-        }
-
-        System.out.println("\nTraffic Sources:");
-        for (Map.Entry<String, Integer> entry : sourceCount.entrySet()) {
-            System.out.println(entry.getKey() + ": " + entry.getValue());
-        }
-
-        System.out.println("================================\n");
+    public RateLimiter() {
+        clientBuckets = new ConcurrentHashMap<>();
     }
 
-    // Auto-refresh every 5 seconds
-    private void startDashboardUpdater() {
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private TokenBucket getBucket(String clientId) {
+        return clientBuckets.computeIfAbsent(
+                clientId,
+                k -> new TokenBucket(MAX_TOKENS, MAX_TOKENS)
+        );
+    }
 
-        scheduler.scheduleAtFixedRate(() -> {
-            getDashboard();
-        }, 5, 5, TimeUnit.SECONDS);
+    // Check rate limit (O(1))
+    public String checkRateLimit(String clientId) {
+        TokenBucket bucket = getBucket(clientId);
+
+        if (bucket.allowRequest()) {
+            return "Allowed (" + bucket.getRemainingTokens() + " requests remaining)";
+        } else {
+            long retry = bucket.getRetryAfterSeconds();
+            return "Denied (0 remaining, retry after " + retry + " sec)";
+        }
+    }
+
+    // Status API
+    public String getRateLimitStatus(String clientId) {
+        TokenBucket bucket = getBucket(clientId);
+
+        int remaining = bucket.getRemainingTokens();
+        int used = MAX_TOKENS - remaining;
+
+        long resetTime = System.currentTimeMillis() / 1000 + bucket.getRetryAfterSeconds();
+
+        return "{used: " + used +
+                ", limit: " + MAX_TOKENS +
+                ", remaining: " + remaining +
+                ", reset: " + resetTime + "}";
     }
 
     // Demo
-    public static void main(String[] args) throws InterruptedException {
-        RealTimeAnalytics analytics = new RealTimeAnalytics();
+    public static void main(String[] args) {
+        RateLimiter limiter = new RateLimiter();
 
-        // Simulate streaming events
-        String[] urls = {"/article/breaking-news", "/sports/championship", "/tech/ai"};
-        String[] sources = {"google", "facebook", "direct"};
+        String client = "abc123";
 
-        Random rand = new Random();
-
-        for (int i = 0; i < 100; i++) {
-            String url = urls[rand.nextInt(urls.length)];
-            String userId = "user_" + rand.nextInt(50);
-            String source = sources[rand.nextInt(sources.length)];
-
-            analytics.processEvent(new Event(url, userId, source));
-
-            Thread.sleep(50); // simulate stream
+        for (int i = 0; i < 5; i++) {
+            System.out.println(limiter.checkRateLimit(client));
         }
+
+        // Simulate hitting limit
+        for (int i = 0; i < 1000; i++) {
+            limiter.checkRateLimit(client);
+        }
+
+        System.out.println(limiter.checkRateLimit(client)); // should deny
+        System.out.println(limiter.getRateLimitStatus(client));
     }
 }
