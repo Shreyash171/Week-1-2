@@ -1,98 +1,107 @@
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
-public class UsernameChecker
-{
+public class FlashSaleInventoryManager {
 
-    // username -> userId
-    private ConcurrentHashMap<String, Integer> userMap;
+    // productId -> stock count
+    private ConcurrentHashMap<String, AtomicInteger> stockMap;
 
-    // username -> attempt frequency
-    private ConcurrentHashMap<String, Integer> attemptMap;
+    // productId -> waiting list (FIFO)
+    private ConcurrentHashMap<String, Queue<Integer>> waitingListMap;
 
-    public UsernameChecker() {
-        userMap = new ConcurrentHashMap<>();
-        attemptMap = new ConcurrentHashMap<>();
+    public FlashSaleInventoryManager() {
+        stockMap = new ConcurrentHashMap<>();
+        waitingListMap = new ConcurrentHashMap<>();
     }
 
-    // Register a username
-    public void registerUser(String username, int userId) {
-        userMap.put(username.toLowerCase(), userId);
+    // Add product with stock
+    public void addProduct(String productId, int stock) {
+        stockMap.put(productId, new AtomicInteger(stock));
+        waitingListMap.put(productId, new LinkedList<>());
     }
 
-    // Check availability (O(1))
-    public boolean checkAvailability(String username) {
-        username = username.toLowerCase();
+    // Check stock (O(1))
+    public String checkStock(String productId) {
+        AtomicInteger stock = stockMap.get(productId);
 
-        // Track attempts
-        attemptMap.put(username, attemptMap.getOrDefault(username, 0) + 1);
+        if (stock == null) {
+            return "Product not found";
+        }
 
-        return !userMap.containsKey(username);
+        return stock.get() + " units available";
     }
 
-    // Suggest alternatives
-    public List<String> suggestAlternatives(String username) {
-        List<String> suggestions = new ArrayList<>();
-        username = username.toLowerCase();
+    // Purchase item (thread-safe)
+    public synchronized String purchaseItem(String productId, int userId) {
+        AtomicInteger stock = stockMap.get(productId);
 
-        // Try appending numbers
-        for (int i = 1; i <= 5; i++) {
-            String suggestion = username + i;
-            if (!userMap.containsKey(suggestion)) {
-                suggestions.add(suggestion);
-            }
+        if (stock == null) {
+            return "Product not found";
         }
 
-        // Replace '_' with '.'
-        String modified = username.replace('_', '.');
-        if (!userMap.containsKey(modified)) {
-            suggestions.add(modified);
+        // If stock available
+        if (stock.get() > 0) {
+            int remaining = stock.decrementAndGet();
+            return "Success! Remaining stock: " + remaining;
         }
 
-        // Add random suffix
-        String randomSuffix = username + (new Random().nextInt(1000));
-        if (!userMap.containsKey(randomSuffix)) {
-            suggestions.add(randomSuffix);
-        }
+        // Add to waiting list
+        Queue<Integer> queue = waitingListMap.get(productId);
+        queue.offer(userId);
 
-        return suggestions;
+        return "Out of stock. Added to waiting list. Position: " + queue.size();
     }
 
-    // Get most attempted username
-    public String getMostAttempted() {
-        String mostAttempted = null;
-        int maxCount = 0;
+    // Process restock and allocate to waiting users
+    public synchronized void restock(String productId, int quantity) {
+        AtomicInteger stock = stockMap.get(productId);
 
-        for (Map.Entry<String, Integer> entry : attemptMap.entrySet()) {
-            if (entry.getValue() > maxCount) {
-                maxCount = entry.getValue();
-                mostAttempted = entry.getKey();
-            }
+        if (stock == null) {
+            return;
         }
 
-        return mostAttempted + " (" + maxCount + " attempts)";
+        stock.addAndGet(quantity);
+
+        Queue<Integer> queue = waitingListMap.get(productId);
+
+        // Fulfill waiting list
+        while (stock.get() > 0 && !queue.isEmpty()) {
+            int userId = queue.poll();
+            stock.decrementAndGet();
+            System.out.println("Allocated product to waiting user: " + userId);
+        }
+    }
+
+    // Get waiting list size
+    public int getWaitingListSize(String productId) {
+        Queue<Integer> queue = waitingListMap.get(productId);
+        return queue != null ? queue.size() : 0;
     }
 
     // Demo
     public static void main(String[] args) {
-        UsernameChecker checker = new UsernameChecker();
+        FlashSaleInventoryManager manager = new FlashSaleInventoryManager();
 
-        // Existing users
-        checker.registerUser("john_doe", 1);
-        checker.registerUser("admin", 2);
+        String product = "IPHONE15_256GB";
 
-        // Availability checks
-        System.out.println("john_doe available? " + checker.checkAvailability("john_doe"));
-        System.out.println("jane_smith available? " + checker.checkAvailability("jane_smith"));
+        manager.addProduct(product, 3);
 
-        // Suggestions
-        System.out.println("Suggestions for john_doe: " + checker.suggestAlternatives("john_doe"));
+        System.out.println(manager.checkStock(product));
 
-        // Simulate multiple attempts
-        for (int i = 0; i < 100; i++) {
-            checker.checkAvailability("admin");
-        }
+        System.out.println(manager.purchaseItem(product, 101));
+        System.out.println(manager.purchaseItem(product, 102));
+        System.out.println(manager.purchaseItem(product, 103));
 
-        System.out.println("Most attempted: " + checker.getMostAttempted());
+        // Now stock is 0
+        System.out.println(manager.purchaseItem(product, 104));
+        System.out.println(manager.purchaseItem(product, 105));
+
+        System.out.println("Waiting list size: " + manager.getWaitingListSize(product));
+
+        // Restock
+        manager.restock(product, 2);
+
+        System.out.println("Final stock: " + manager.checkStock(product));
     }
 }
