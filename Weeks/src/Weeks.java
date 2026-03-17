@@ -1,117 +1,126 @@
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
-public class RateLimiter {
+public class AutocompleteSystem {
 
-    // Token Bucket class
-    static class TokenBucket {
-        private final int maxTokens;
-        private final double refillRatePerSec; // tokens per second
+    // Trie Node
+    static class TrieNode {
+        Map<Character, TrieNode> children = new HashMap<>();
+        Map<String, Integer> queryFrequency = new HashMap<>(); // queries passing through node
+    }
 
-        private double tokens;
-        private long lastRefillTime;
+    private TrieNode root;
 
-        public TokenBucket(int maxTokens, int refillPerHour) {
-            this.maxTokens = maxTokens;
-            this.refillRatePerSec = refillPerHour / 3600.0;
-            this.tokens = maxTokens;
-            this.lastRefillTime = System.currentTimeMillis();
+    // Global frequency store
+    private ConcurrentHashMap<String, Integer> globalFreq;
+
+    public AutocompleteSystem() {
+        root = new TrieNode();
+        globalFreq = new ConcurrentHashMap<>();
+    }
+
+    // Insert or update query
+    public void insert(String query) {
+        globalFreq.put(query, globalFreq.getOrDefault(query, 0) + 1);
+
+        TrieNode node = root;
+        for (char c : query.toCharArray()) {
+            node.children.putIfAbsent(c, new TrieNode());
+            node = node.children.get(c);
+
+            // Update frequency at each prefix node
+            node.queryFrequency.put(query, globalFreq.get(query));
         }
+    }
 
-        // Refill tokens based on elapsed time
-        private synchronized void refill() {
-            long now = System.currentTimeMillis();
-            double elapsedSeconds = (now - lastRefillTime) / 1000.0;
+    // Get top 10 suggestions for prefix
+    public List<String> search(String prefix) {
+        TrieNode node = root;
 
-            double tokensToAdd = elapsedSeconds * refillRatePerSec;
-            tokens = Math.min(maxTokens, tokens + tokensToAdd);
-
-            lastRefillTime = now;
-        }
-
-        // Try consuming a token
-        public synchronized boolean allowRequest() {
-            refill();
-
-            if (tokens >= 1) {
-                tokens -= 1;
-                return true;
+        // Traverse trie
+        for (char c : prefix.toCharArray()) {
+            if (!node.children.containsKey(c)) {
+                return Collections.emptyList();
             }
-            return false;
+            node = node.children.get(c);
         }
 
-        public synchronized int getRemainingTokens() {
-            refill();
-            return (int) tokens;
+        // Min Heap for top 10
+        PriorityQueue<Map.Entry<String, Integer>> minHeap =
+                new PriorityQueue<>(Map.Entry.comparingByValue());
+
+        for (Map.Entry<String, Integer> entry : node.queryFrequency.entrySet()) {
+            minHeap.offer(entry);
+            if (minHeap.size() > 10) {
+                minHeap.poll();
+            }
         }
 
-        public synchronized long getRetryAfterSeconds() {
-            if (tokens >= 1) return 0;
-
-            double tokensNeeded = 1 - tokens;
-            return (long) Math.ceil(tokensNeeded / refillRatePerSec);
+        List<String> result = new ArrayList<>();
+        while (!minHeap.isEmpty()) {
+            result.add(minHeap.poll().getKey());
         }
+
+        Collections.reverse(result); // highest frequency first
+        return result;
     }
 
-    // clientId -> TokenBucket
-    private ConcurrentHashMap<String, TokenBucket> clientBuckets;
+    // Handle typo (simple edit distance = 1)
+    public List<String> suggestWithTypo(String input) {
+        List<String> suggestions = new ArrayList<>();
 
-    private final int MAX_TOKENS = 1000; // per hour
-
-    public RateLimiter() {
-        clientBuckets = new ConcurrentHashMap<>();
-    }
-
-    private TokenBucket getBucket(String clientId) {
-        return clientBuckets.computeIfAbsent(
-                clientId,
-                k -> new TokenBucket(MAX_TOKENS, MAX_TOKENS)
-        );
-    }
-
-    // Check rate limit (O(1))
-    public String checkRateLimit(String clientId) {
-        TokenBucket bucket = getBucket(clientId);
-
-        if (bucket.allowRequest()) {
-            return "Allowed (" + bucket.getRemainingTokens() + " requests remaining)";
-        } else {
-            long retry = bucket.getRetryAfterSeconds();
-            return "Denied (0 remaining, retry after " + retry + " sec)";
+        for (String query : globalFreq.keySet()) {
+            if (isOneEditAway(input, query)) {
+                suggestions.add(query);
+            }
         }
+
+        return suggestions;
     }
 
-    // Status API
-    public String getRateLimitStatus(String clientId) {
-        TokenBucket bucket = getBucket(clientId);
+    // Check edit distance = 1
+    private boolean isOneEditAway(String s1, String s2) {
+        if (Math.abs(s1.length() - s2.length()) > 1) return false;
 
-        int remaining = bucket.getRemainingTokens();
-        int used = MAX_TOKENS - remaining;
+        int i = 0, j = 0, edits = 0;
 
-        long resetTime = System.currentTimeMillis() / 1000 + bucket.getRetryAfterSeconds();
+        while (i < s1.length() && j < s2.length()) {
+            if (s1.charAt(i) != s2.charAt(j)) {
+                edits++;
+                if (edits > 1) return false;
 
-        return "{used: " + used +
-                ", limit: " + MAX_TOKENS +
-                ", remaining: " + remaining +
-                ", reset: " + resetTime + "}";
+                if (s1.length() > s2.length()) i++;
+                else if (s1.length() < s2.length()) j++;
+                else {
+                    i++;
+                    j++;
+                }
+            } else {
+                i++;
+                j++;
+            }
+        }
+
+        return true;
     }
 
     // Demo
     public static void main(String[] args) {
-        RateLimiter limiter = new RateLimiter();
+        AutocompleteSystem system = new AutocompleteSystem();
 
-        String client = "abc123";
+        system.insert("java tutorial");
+        system.insert("javascript");
+        system.insert("java download");
+        system.insert("java tutorial");
+        system.insert("java 21 features");
 
-        for (int i = 0; i < 5; i++) {
-            System.out.println(limiter.checkRateLimit(client));
+        System.out.println("Search 'jav':");
+        List<String> results = system.search("jav");
+        for (String r : results) {
+            System.out.println(r);
         }
 
-        // Simulate hitting limit
-        for (int i = 0; i < 1000; i++) {
-            limiter.checkRateLimit(client);
-        }
-
-        System.out.println(limiter.checkRateLimit(client)); // should deny
-        System.out.println(limiter.getRateLimitStatus(client));
+        System.out.println("\nTypo suggestions for 'jvaa':");
+        System.out.println(system.suggestWithTypo("jvaa"));
     }
 }
